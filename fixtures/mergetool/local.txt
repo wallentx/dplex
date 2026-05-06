@@ -1,0 +1,7 @@
+service "search" {
+  image = "registry.example.com/search:1.9"
+  replicas = 3
+  env = {
+    LOG_LEVEL = "info"
+  }
+}

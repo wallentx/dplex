@@ -1,0 +1,25 @@
+app:
+  name: dplex-demo
+  environment: production
+  log_level: debug
+
+server:
+  host: 0.0.0.0
+  port: 9090
+  workers: 4
+  request_timeout_seconds: 30
+
+features:
+  conflict_preview: true
+  save_as_prompt: true
+  telemetry: false
+  audit_log: true
+
+database:
+  host: db.production.internal
+  pool_size: 16
+  statement_timeout_ms: 1500
+
+cache:
+  enabled: true
+  ttl_seconds: 300

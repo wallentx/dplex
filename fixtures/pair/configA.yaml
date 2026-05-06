@@ -1,0 +1,24 @@
+app:
+  name: dplex-demo
+  environment: staging
+  log_level: info
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  workers: 2
+  request_timeout_seconds: 30
+
+features:
+  conflict_preview: false
+  save_as_prompt: false
+  telemetry: false
+
+database:
+  host: db.staging.internal
+  pool_size: 8
+  statement_timeout_ms: 1500
+
+cache:
+  enabled: true
+  ttl_seconds: 60

@@ -1,0 +1,8 @@
+service "search" {
+  image = "registry.example.com/search:2.0"
+  replicas = 2
+  env = {
+    LOG_LEVEL = "debug"
+    CACHE_TTL_SECONDS = "120"
+  }
+}

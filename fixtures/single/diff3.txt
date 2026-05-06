@@ -1,0 +1,17 @@
+fn choose_region(account_tier: &str) -> &'static str {
+<<<<<<< HEAD
+    if account_tier == "enterprise" {
+        "us-east-1"
+    } else {
+        "us-west-2"
+    }
+||||||| base
+    "us-west-2"
+=======
+    match account_tier {
+        "enterprise" => "us-east-1",
+        "trial" => "us-central-1",
+        _ => "us-west-2",
+    }
+>>>>>>> feature/region-routing
+}

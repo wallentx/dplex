@@ -1,0 +1,14 @@
+name = "dplex"
+version = "0.1.0"
+
+[ui]
+<<<<<<< HEAD
+theme = "classic"
+show_line_numbers = false
+=======
+theme = "contrast"
+show_line_numbers = true
+>>>>>>> feature/terminal-preview
+
+[merge]
+tool = "dplex"

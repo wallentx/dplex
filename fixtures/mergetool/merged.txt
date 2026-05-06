@@ -1,0 +1,17 @@
+service "search" {
+<<<<<<< HEAD
+  image = "registry.example.com/search:1.9"
+  replicas = 3
+=======
+  image = "registry.example.com/search:2.0"
+  replicas = 2
+>>>>>>> feature/search-upgrade
+  env = {
+<<<<<<< HEAD
+    LOG_LEVEL = "info"
+=======
+    LOG_LEVEL = "debug"
+    CACHE_TTL_SECONDS = "120"
+>>>>>>> feature/search-upgrade
+  }
+}

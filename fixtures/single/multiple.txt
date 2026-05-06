@@ -1,0 +1,32 @@
+# Release checklist
+
+## Build
+
+<<<<<<< HEAD
+- Run `cargo test`
+- Build the release binary with `cargo build --release`
+=======
+- Run `cargo fmt -- --check`
+- Run `cargo test`
+- Build the release binary with `cargo build --release`
+>>>>>>> feature/release-checks
+
+## Publish
+
+<<<<<<< HEAD
+- Tag the release after smoke testing.
+- Upload the binary manually.
+=======
+- Tag the release after smoke testing.
+- Upload the binary and checksum.
+- Paste the fixture command into the release notes.
+>>>>>>> feature/release-checks
+
+## Verify
+
+<<<<<<< HEAD
+- Run `dplex --help`
+=======
+- Run `dplex --help`
+- Run `dplex fixtures/single/simple.txt` against a copied fixture.
+>>>>>>> feature/release-checks
