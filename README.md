@@ -1,6 +1,11 @@
 # dplex
 
+<img width="1343" height="1642" alt="1000035721" src="https://github.com/user-attachments/assets/5a551739-9227-4389-996b-214a49803237" />
+
+
 `dplex` is an interactive terminal merge conflict reviewer.
+
+It lets you review hunks ( ͡° ͜ʖ ͡°)
 
 Pass it a file that contains Git conflict markers:
 
