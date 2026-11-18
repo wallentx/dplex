@@ -1,9 +1,10 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -35,11 +36,15 @@ pub struct ReviewOutcome {
 enum Action {
     ChooseTheirs,
     ChooseOurs,
+    Undo,
+    Finish,
     Quit,
     Next,
     Previous,
     ScrollDown,
     ScrollUp,
+    PanLeft,
+    PanRight,
     PageDown,
     PageUp,
     Save,
@@ -54,7 +59,9 @@ struct ReviewState<'a> {
     conflicts: &'a [Conflict],
     decisions: HashMap<usize, Decision>,
     saved_decisions: HashMap<usize, Decision>,
+    history: Vec<(usize, Option<Decision>)>,
     current_index: usize,
+    column: usize,
     scroll_top: usize,
     save_path: PathBuf,
     status_message: Option<String>,
@@ -74,91 +81,182 @@ where
         return Err("interactive review requires a TTY".to_string());
     }
 
-    let mut state = ReviewState {
-        path,
-        source_lines,
-        conflicts,
-        decisions: HashMap::new(),
-        saved_decisions: HashMap::new(),
-        current_index: 0,
-        scroll_top: 0,
-        save_path: initial_save_path,
-        status_message: None,
-    };
-    focus_current_conflict(&mut state);
+    let mut state = ReviewState::new(path, source_lines, conflicts, initial_save_path);
     let mut terminal = TerminalSession::enter()?;
-    let mut quit = false;
-
-    while state.decisions.len() < state.conflicts.len() {
-        if state.decisions.contains_key(&state.current_index) {
-            state.current_index = next_pending_index(&state).unwrap_or(state.current_index);
-            focus_current_conflict(&mut state);
-        }
-
+    let quit = loop {
         terminal.draw(&state)?;
-        match read_action()? {
-            Action::ChooseTheirs => {
-                state
-                    .decisions
-                    .insert(state.current_index, Decision::Incoming);
-                state.current_index = next_pending_index(&state).unwrap_or(state.current_index);
-                focus_current_conflict(&mut state);
+        let action = read_action()?;
+        match action {
+            Action::ChooseTheirs => state.choose(Decision::Incoming),
+            Action::ChooseOurs => state.choose(Decision::Current),
+            Action::Undo => state.undo(),
+            Action::Finish if state.decisions.len() == state.conflicts.len() => {
+                if state.saved_decisions == state.decisions || state.save(None, &mut save) {
+                    break false;
+                }
             }
-            Action::ChooseOurs => {
-                state
-                    .decisions
-                    .insert(state.current_index, Decision::Current);
-                state.current_index = next_pending_index(&state).unwrap_or(state.current_index);
-                focus_current_conflict(&mut state);
+            Action::Finish => {
+                state.status_message = Some("Choose a side for each hunk before finishing.".into());
             }
             Action::Quit => {
-                quit = true;
-                break;
+                if state.decisions == state.saved_decisions {
+                    break true;
+                }
+                match prompt_for_quit(&mut terminal, &state)? {
+                    QuitChoice::Discard => break true,
+                    QuitChoice::Save if state.save(None, &mut save) => break true,
+                    _ => {}
+                }
             }
-            Action::Next => {
-                state.current_index = next_pending_index(&state).unwrap_or(state.current_index);
-                focus_current_conflict(&mut state);
-            }
+            Action::Next => state.focus((state.current_index + 1) % conflicts.len()),
             Action::Previous => {
-                state.current_index = previous_pending_index(&state).unwrap_or(state.current_index);
-                focus_current_conflict(&mut state);
+                state.focus((state.current_index + conflicts.len() - 1) % conflicts.len());
             }
-            Action::ScrollDown => {
-                state.scroll_top = state.scroll_top.saturating_add(1);
-            }
-            Action::ScrollUp => {
-                state.scroll_top = state.scroll_top.saturating_sub(1);
-            }
-            Action::PageDown => {
-                state.scroll_top = state.scroll_top.saturating_add(page_height());
-            }
-            Action::PageUp => {
-                state.scroll_top = state.scroll_top.saturating_sub(page_height());
+            Action::ScrollDown => state.scroll_top = state.scroll_top.saturating_add(1),
+            Action::ScrollUp => state.scroll_top = state.scroll_top.saturating_sub(1),
+            Action::PageDown => state.scroll_top = state.scroll_top.saturating_add(page_height()),
+            Action::PageUp => state.scroll_top = state.scroll_top.saturating_sub(page_height()),
+            Action::PanLeft | Action::PanRight => {
+                let width = render_area(terminal.terminal.get_frame().area()).width as usize;
+                let columns = width.saturating_sub(6 + line_number_width(source_lines.len()));
+                let step = columns.saturating_sub(2).clamp(1, 8);
+                if action == Action::PanLeft {
+                    state.column = state.column.saturating_sub(step);
+                } else {
+                    let longest = build_document_view(&state)
+                        .iter()
+                        .map(|line| Span::raw(line.display_text()).width())
+                        .max()
+                        .unwrap_or(0);
+                    state.column = state
+                        .column
+                        .saturating_add(step)
+                        .min(longest.saturating_sub(columns));
+                }
             }
             Action::Save => {
-                save(&state.decisions, &state.save_path)?;
-                state.saved_decisions = state.decisions.clone();
-                state.status_message = Some(format!("saved to {}", state.save_path.display()));
+                state.save(None, &mut save);
             }
             Action::SaveAs => {
                 if let Some(path) = prompt_for_save_path(&mut terminal, &state, "Save as: ")? {
-                    save(&state.decisions, &path)?;
-                    state.save_path = path;
-                    state.saved_decisions = state.decisions.clone();
-                    state.status_message = Some(format!("saved to {}", state.save_path.display()));
+                    state.save(Some(path), &mut save);
                 } else {
                     state.status_message = Some("save as canceled".to_string());
                 }
             }
             Action::None => {}
         }
-    }
+    };
 
     Ok(ReviewOutcome {
-        decisions: state.decisions,
+        decisions: state.saved_decisions,
         quit,
         save_path: state.save_path,
     })
+}
+
+impl<'a> ReviewState<'a> {
+    fn new(
+        path: &'a Path,
+        source_lines: &'a [String],
+        conflicts: &'a [Conflict],
+        save_path: PathBuf,
+    ) -> Self {
+        let mut state = Self {
+            path,
+            source_lines,
+            conflicts,
+            decisions: HashMap::new(),
+            saved_decisions: HashMap::new(),
+            history: Vec::new(),
+            current_index: 0,
+            column: 0,
+            scroll_top: 0,
+            save_path,
+            status_message: None,
+        };
+        focus_current_conflict(&mut state);
+        state
+    }
+
+    fn choose(&mut self, decision: Decision) {
+        let old = self.decisions.insert(self.current_index, decision);
+        if old != Some(decision) {
+            self.history.push((self.current_index, old));
+        }
+        self.focus(next_pending_index(self).unwrap_or(self.current_index));
+    }
+
+    fn undo(&mut self) {
+        if let Some((index, old)) = self.history.pop() {
+            match old {
+                Some(decision) => self.decisions.insert(index, decision),
+                None => self.decisions.remove(&index),
+            };
+            self.focus(index);
+        } else {
+            self.status_message = Some("There are no choices to undo.".into());
+        }
+    }
+
+    fn focus(&mut self, index: usize) {
+        self.current_index = index;
+        self.column = 0;
+        self.status_message = None;
+        focus_current_conflict(self);
+    }
+
+    fn save<F>(&mut self, path: Option<PathBuf>, save: &mut F) -> bool
+    where
+        F: FnMut(&HashMap<usize, Decision>, &Path) -> Result<(), String>,
+    {
+        let destination = path.as_deref().unwrap_or(&self.save_path);
+        match save(&self.decisions, destination) {
+            Ok(()) => {
+                self.status_message = Some(format!("saved to {}", destination.display()));
+                if let Some(path) = path {
+                    self.save_path = path;
+                }
+                self.saved_decisions.clone_from(&self.decisions);
+                true
+            }
+            Err(error) => {
+                self.status_message = Some(error);
+                false
+            }
+        }
+    }
+}
+
+enum QuitChoice {
+    Save,
+    Discard,
+    Continue,
+}
+
+fn prompt_for_quit(
+    terminal: &mut TerminalSession,
+    state: &ReviewState<'_>,
+) -> Result<QuitChoice, String> {
+    loop {
+        let prompt = if terminal.terminal.get_frame().area().width >= 65 {
+            "Unsaved choices: [s] save and quit  [d] discard  [Esc] continue"
+        } else {
+            "Unsaved choices\n[s] save and quit\n[d] discard\n[Esc] continue"
+        };
+        terminal.draw_with_prompt(state, prompt, "")?;
+        if let Event::Key(key) = event::read().map_err(|error| error.to_string())? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('s') => return Ok(QuitChoice::Save),
+                KeyCode::Char('d') if key.modifiers.is_empty() => return Ok(QuitChoice::Discard),
+                KeyCode::Esc => return Ok(QuitChoice::Continue),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn render_screen(frame: &mut Frame<'_>, state: &ReviewState<'_>) {
@@ -184,8 +282,18 @@ fn render_screen(frame: &mut Frame<'_>, state: &ReviewState<'_>) {
     let body_width = chunks[2].width as usize;
 
     let header_width = chunks[0].width as usize;
+    let choice = match state.decisions.get(&state.current_index) {
+        None => "choose ours or theirs",
+        Some(Decision::Current) => "chose ours",
+        Some(Decision::Incoming) => "chose theirs",
+    };
+    let finish_hint = if counts.pending == 0 {
+        "  Enter saves and finishes"
+    } else {
+        ""
+    };
     let prompt = format!(
-        "[{}/{}] choose ours or theirs",
+        "[{}/{}] {choice}{finish_hint}",
         state.current_index + 1,
         state.conflicts.len()
     );
@@ -263,7 +371,7 @@ fn render_screen(frame: &mut Frame<'_>, state: &ReviewState<'_>) {
         .iter()
         .skip(scroll_top)
         .take(body_height)
-        .map(|line| document_line(line, number_width, body_width, state.current_index))
+        .map(|line| document_line(line, number_width, body_width, state))
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[2]);
 
@@ -271,13 +379,14 @@ fn render_screen(frame: &mut Frame<'_>, state: &ReviewState<'_>) {
 
     let visible_end = (scroll_top + body_height).min(document.len());
     let position = format!(
-        "Lines {}-{} of {}",
+        "Lines {}-{} of {}  Col {}",
         (scroll_top + 1).min(document.len().max(1)),
         visible_end,
-        document.len()
+        document.len(),
+        state.column + 1
     );
     let footer = match &state.status_message {
-        Some(message) => format!("{position}  {message}"),
+        Some(message) => message.clone(),
         None => position,
     };
     let controls = Paragraph::new(vec![
@@ -286,6 +395,10 @@ fn render_screen(frame: &mut Frame<'_>, state: &ReviewState<'_>) {
             label(" ours  "),
             key("t"),
             label(" theirs  "),
+            key("u"),
+            label(" undo  "),
+            key("h/l"),
+            label(" pan  "),
             key("C-s"),
             label(" save  "),
             key("S"),
@@ -330,29 +443,29 @@ fn label(text: &'static str) -> Span<'static> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum DocumentLine {
+enum DocumentLine<'a> {
     Context {
         line_number: usize,
-        text: String,
+        text: &'a str,
     },
     Current {
         conflict_index: usize,
         line_number: usize,
-        text: String,
+        text: &'a str,
     },
     Incoming {
         conflict_index: usize,
-        text: String,
+        text: &'a str,
     },
     Resolved {
         conflict_index: usize,
         line_number: Option<usize>,
-        text: String,
+        text: &'a str,
         dirty: bool,
     },
 }
 
-fn build_document_view(state: &ReviewState<'_>) -> Vec<DocumentLine> {
+fn build_document_view<'a>(state: &ReviewState<'a>) -> Vec<DocumentLine<'a>> {
     let mut lines = Vec::new();
     let mut cursor = 0;
 
@@ -362,19 +475,23 @@ fn build_document_view(state: &ReviewState<'_>) -> Vec<DocumentLine> {
             if let Some(text) = state.source_lines.get(line_number) {
                 lines.push(DocumentLine::Context {
                     line_number: line_number + 1,
-                    text: text.clone(),
+                    text,
                 });
             }
         }
 
-        match state.decisions.get(&conflict_index) {
+        match state
+            .decisions
+            .get(&conflict_index)
+            .filter(|_| conflict_index != state.current_index)
+        {
             Some(Decision::Current) => {
                 let dirty = state.saved_decisions.get(&conflict_index) != Some(&Decision::Current);
                 for (offset, text) in conflict.current.iter().enumerate() {
                     lines.push(DocumentLine::Resolved {
                         conflict_index,
                         line_number: Some(start + offset + 1),
-                        text: text.clone(),
+                        text,
                         dirty,
                     });
                 }
@@ -385,7 +502,7 @@ fn build_document_view(state: &ReviewState<'_>) -> Vec<DocumentLine> {
                     lines.push(DocumentLine::Resolved {
                         conflict_index,
                         line_number: None,
-                        text: text.clone(),
+                        text,
                         dirty,
                     });
                 }
@@ -395,14 +512,14 @@ fn build_document_view(state: &ReviewState<'_>) -> Vec<DocumentLine> {
                     lines.push(DocumentLine::Current {
                         conflict_index,
                         line_number: start + offset + 1,
-                        text: text.clone(),
+                        text,
                     });
                 }
 
                 for text in &conflict.incoming {
                     lines.push(DocumentLine::Incoming {
                         conflict_index,
-                        text: text.clone(),
+                        text,
                     });
                 }
             }
@@ -415,7 +532,7 @@ fn build_document_view(state: &ReviewState<'_>) -> Vec<DocumentLine> {
         if let Some(text) = state.source_lines.get(line_number) {
             lines.push(DocumentLine::Context {
                 line_number: line_number + 1,
-                text: text.clone(),
+                text,
             });
         }
     }
@@ -423,122 +540,60 @@ fn build_document_view(state: &ReviewState<'_>) -> Vec<DocumentLine> {
     if lines.is_empty() {
         lines.push(DocumentLine::Context {
             line_number: 1,
-            text: "(empty file)".to_string(),
+            text: "(empty file)\n",
         });
     }
     lines
 }
 
 fn document_line(
-    line: &DocumentLine,
+    line: &DocumentLine<'_>,
     number_width: usize,
     width: usize,
-    current_index: usize,
+    state: &ReviewState<'_>,
 ) -> Line<'static> {
-    let selected = line.conflict_index() == Some(current_index);
-    match line {
-        DocumentLine::Context { line_number, text } => {
-            context_line(*line_number, text, number_width, width)
+    let selected = line.conflict_index() == Some(state.current_index);
+    let (number, kind) = match line {
+        DocumentLine::Context { line_number, .. } => (Some(*line_number), None),
+        DocumentLine::Current { line_number, .. } => (Some(*line_number), Some(DiffKind::Current)),
+        DocumentLine::Incoming { .. } => (None, Some(DiffKind::Incoming)),
+        DocumentLine::Resolved { line_number, .. } => (*line_number, None),
+    };
+    let (marker, marker_style, gutter_style, content_style) = match kind {
+        Some(kind) => (
+            if kind == DiffKind::Current {
+                " -"
+            } else {
+                " +"
+            },
+            diff_marker_style(kind, selected),
+            diff_gutter_style(selected, kind),
+            diff_content_style(kind, selected),
+        ),
+        None => {
+            let style = if matches!(line, DocumentLine::Resolved { dirty: true, .. }) {
+                Style::default()
+                    .fg(warm_yellow())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(226, 226, 226))
+            };
+            ("  ", neutral_gutter_style(), neutral_gutter_style(), style)
         }
-        DocumentLine::Current {
-            line_number, text, ..
-        } => diff_line(
-            DiffKind::Current,
-            selected,
-            Some(*line_number),
-            text,
-            number_width,
-            width,
-        ),
-        DocumentLine::Incoming { text, .. } => diff_line(
-            DiffKind::Incoming,
-            selected,
-            None,
-            text,
-            number_width,
-            width,
-        ),
-        DocumentLine::Resolved {
-            line_number,
-            text,
-            dirty,
-            ..
-        } => resolved_line(*line_number, text, *dirty, number_width, width),
-    }
-}
-
-fn context_line(
-    line_number: usize,
-    text: &str,
-    number_width: usize,
-    width: usize,
-) -> Line<'static> {
-    let prefix = format!("   {line_number:>number_width$} | ");
-    let content_width = width.saturating_sub(prefix.chars().count());
-    Line::from(vec![
-        Span::styled(prefix, neutral_gutter_style()),
-        Span::styled(
-            truncate(text, content_width),
-            Style::default().fg(Color::Rgb(226, 226, 226)),
-        ),
-    ])
-}
-
-fn diff_line(
-    kind: DiffKind,
-    selected: bool,
-    line_number: Option<usize>,
-    text: &str,
-    number_width: usize,
-    width: usize,
-) -> Line<'static> {
-    let marker = match (kind, selected) {
-        (DiffKind::Current, _) => " -",
-        (DiffKind::Incoming, _) => " +",
     };
-    let number = line_number
-        .map(|line_number| line_number.to_string())
-        .unwrap_or_default();
+    let number = number.map(|n| n.to_string()).unwrap_or_default();
     let gutter = format!(" {number:>number_width$} | ");
-    let marker_width = marker.chars().count();
-    let gutter_width = gutter.chars().count();
-    let content_width = width.saturating_sub(marker_width + gutter_width);
+    let content_width = width.saturating_sub(marker.len() + gutter.len());
+    let content = visible_columns(&line.display_text(), state.column, content_width);
     let content = if selected {
-        pad_to_width(&truncate(text, content_width), content_width)
+        pad_to_width(&content, content_width)
     } else {
-        truncate(text, content_width)
+        content
     };
-
     Line::from(vec![
-        Span::styled(marker.to_string(), diff_marker_style(kind, selected)),
-        Span::styled(gutter, diff_gutter_style(selected, kind)),
-        Span::styled(content, diff_content_style(kind, selected)),
-    ])
-}
-
-fn resolved_line(
-    line_number: Option<usize>,
-    text: &str,
-    dirty: bool,
-    number_width: usize,
-    width: usize,
-) -> Line<'static> {
-    let number = line_number
-        .map(|line_number| line_number.to_string())
-        .unwrap_or_default();
-    let prefix = format!("   {number:>number_width$} | ");
-    let content_width = width.saturating_sub(prefix.chars().count());
-    let content_style = if dirty {
-        Style::default()
-            .fg(warm_yellow())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(226, 226, 226))
-    };
-
-    Line::from(vec![
-        Span::styled(prefix, neutral_gutter_style()),
-        Span::styled(truncate(text, content_width), content_style),
+        Span::styled(marker, marker_style),
+        Span::styled(gutter, gutter_style),
+        Span::styled(content, content_style),
     ])
 }
 
@@ -642,23 +697,35 @@ fn status_gray() -> Color {
     Color::Rgb(138, 138, 150)
 }
 
-fn truncate(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
+fn visible_columns(text: &str, offset: usize, width: usize) -> String {
+    let span = Span::raw(text);
+    let clipped = width > 2 && span.width() > offset.saturating_add(width);
+    let right = offset.saturating_add(width - usize::from(clipped));
+    let mut column = 0;
+    let mut output = String::new();
+    for grapheme in span.styled_graphemes(Style::default()) {
+        if column >= right {
+            break;
+        }
+        let end = column + Span::raw(grapheme.symbol).width();
+        if end > offset && end <= right {
+            if column >= offset {
+                output.push_str(grapheme.symbol);
+            } else {
+                // The viewport starts inside a wide grapheme.
+                output.push_str(&" ".repeat(end - offset));
+            }
+        }
+        column = end;
     }
-    let mut chars = text.chars();
-    let truncated: String = chars.by_ref().take(width).collect();
-    if chars.next().is_some() {
-        let mut truncated: String = truncated.chars().take(width.saturating_sub(1)).collect();
-        truncated.push('…');
-        truncated
-    } else {
-        truncated
+    if clipped {
+        output.push('…');
     }
+    output
 }
 
 fn pad_to_width(text: &str, width: usize) -> String {
-    let length = text.chars().count();
+    let length = Span::raw(text).width();
     if length >= width {
         text.to_string()
     } else {
@@ -678,7 +745,29 @@ fn focused_scroll_top(state: &ReviewState<'_>) -> usize {
         .saturating_sub(5)
 }
 
-impl DocumentLine {
+impl DocumentLine<'_> {
+    fn display_text(&self) -> Cow<'_, str> {
+        let text = match self {
+            Self::Context { text, .. }
+            | Self::Current { text, .. }
+            | Self::Incoming { text, .. }
+            | Self::Resolved { text, .. } => text,
+        };
+        if let Some(content) = text.strip_suffix("\r\n") {
+            if self.conflict_index().is_some() {
+                return Cow::Owned(format!("{content} [CRLF]"));
+            }
+            Cow::Borrowed(content)
+        } else if let Some(content) = text.strip_suffix('\n') {
+            if content.is_empty() && self.conflict_index().is_some() {
+                return Cow::Borrowed("[blank line]");
+            }
+            Cow::Borrowed(content)
+        } else {
+            Cow::Owned(format!("{text} [no newline]"))
+        }
+    }
+
     fn conflict_index(&self) -> Option<usize> {
         match self {
             DocumentLine::Context { .. } => None,
@@ -699,23 +788,17 @@ fn next_pending_index(state: &ReviewState<'_>) -> Option<usize> {
     None
 }
 
-fn previous_pending_index(state: &ReviewState<'_>) -> Option<usize> {
-    for offset in 1..=state.conflicts.len() {
-        let index = (state.current_index + state.conflicts.len() - offset) % state.conflicts.len();
-        if !state.decisions.contains_key(&index) {
-            return Some(index);
-        }
-    }
-    None
-}
-
 fn read_action() -> Result<Action, String> {
     loop {
-        if let Event::Key(key) = event::read().map_err(|error| error.to_string())? {
-            let action = action_from_key(key);
-            if action != Action::None {
-                return Ok(action);
+        match event::read().map_err(|error| error.to_string())? {
+            Event::Resize(_, _) => return Ok(Action::None),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let action = action_from_key(key);
+                if action != Action::None {
+                    return Ok(action);
+                }
             }
+            _ => {}
         }
     }
 }
@@ -738,6 +821,10 @@ fn action_from_key(key: KeyEvent) -> Action {
             Action::ChooseOurs
         }
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Action::Quit,
+        KeyCode::Char('u') => Action::Undo,
+        KeyCode::Enter => Action::Finish,
+        KeyCode::Char('h') => Action::PanLeft,
+        KeyCode::Char('l') => Action::PanRight,
         KeyCode::Right | KeyCode::Char(']') => Action::Next,
         KeyCode::Left | KeyCode::Char('[') => Action::Previous,
         KeyCode::Down => Action::ScrollDown,
@@ -759,6 +846,9 @@ fn prompt_for_save_path(
     loop {
         terminal.draw_with_prompt(state, prompt, &input)?;
         if let Event::Key(key) = event::read().map_err(|error| error.to_string())? {
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
             match key.code {
                 KeyCode::Enter => {
                     let trimmed = input.trim();
@@ -785,20 +875,22 @@ fn prompt_for_save_path(
 
 fn render_prompt(frame: &mut Frame<'_>, prompt: &str, input: &str) {
     let area = render_area(frame.area());
+    let mut lines: Vec<_> = prompt
+        .lines()
+        .map(|line| Line::styled(line, Style::default().fg(Color::Yellow)))
+        .collect();
+    if let Some(last) = lines.last_mut() {
+        last.push_span(Span::raw(input).style(Style::default()));
+    }
+    let height = area.height.min(lines.len() as u16);
     let prompt_area = Rect {
         x: area.x,
-        y: area.y + area.height.saturating_sub(1),
+        y: area.bottom() - height,
         width: area.width,
-        height: 1,
+        height,
     };
     frame.render_widget(Clear, prompt_area);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(prompt.to_string(), Style::default().fg(Color::Yellow)),
-            Span::raw(input.to_string()),
-        ])),
-        prompt_area,
-    );
+    frame.render_widget(Paragraph::new(lines), prompt_area);
 }
 
 struct TerminalSession {
@@ -880,6 +972,72 @@ mod tests {
     }
 
     #[test]
+    fn revisits_and_undoes_past_checkpoints() {
+        let source = vec!["delete me\n".to_string(), "old\n".to_string()];
+        let incoming = vec!["new\n".to_string()];
+        let conflict = |line: usize, theirs: Vec<String>| Conflict {
+            start_line: line,
+            end_line: line,
+            current_label: "ours".into(),
+            incoming_label: "theirs".into(),
+            current: vec![source[line - 1].clone()],
+            incoming: theirs,
+        };
+        let conflicts = [conflict(1, vec![]), conflict(2, incoming)];
+        let path = Path::new("ours");
+        let mut state = ReviewState::new(path, &source, &conflicts, path.into());
+        state.choose(Decision::Incoming);
+        assert_eq!(state.current_index, 1);
+        assert!(state.save(None, &mut |_, _| Ok(())));
+        state.choose(Decision::Incoming);
+        assert_eq!(state.decisions.len(), 2);
+        state.focus(0);
+        assert!(build_document_view(&state).iter().any(|line| matches!(
+            line,
+            DocumentLine::Current {
+                conflict_index: 0,
+                text: "delete me\n",
+                ..
+            }
+        )));
+        state.choose(Decision::Current);
+        state.undo();
+        assert_eq!(state.decisions[&0], Decision::Incoming);
+        state.undo();
+        assert_eq!(state.decisions, state.saved_decisions);
+        state.undo();
+        assert!(state.decisions.is_empty());
+        assert_eq!(state.saved_decisions.len(), 1);
+        assert!(!state.save(Some("bad".into()), &mut |_, _| Err("denied".into())));
+        assert_eq!(state.save_path, path);
+        assert_eq!(state.saved_decisions.len(), 1);
+    }
+
+    #[test]
+    fn displays_distinct_line_endings() {
+        let line = |text| DocumentLine::Incoming {
+            conflict_index: 0,
+            text,
+        };
+        assert_eq!(line("x\n").display_text(), "x");
+        assert_eq!(line("x\r\n").display_text(), "x [CRLF]");
+        assert_eq!(line("x\r\r\n").display_text(), "x\r [CRLF]");
+        assert_eq!(line("x").display_text(), "x [no newline]");
+        assert_eq!(line("\n").display_text(), "[blank line]");
+    }
+
+    #[test]
+    fn pans_by_terminal_columns_without_splitting_graphemes() {
+        let text = "hello界e\u{301}world";
+        assert_eq!(visible_columns(text, 0, 5), "hell…");
+        assert_eq!(visible_columns(text, 5, 3), "界…");
+        assert_eq!(visible_columns(text, 6, 3), " e\u{301}…");
+        assert_eq!(visible_columns(text, 8, 5), "world");
+        assert_eq!(visible_columns(text, 5, 2), "界");
+        assert_eq!(visible_columns(text, 0, 0), "");
+    }
+
+    #[test]
     fn parses_review_actions() {
         assert_eq!(
             action_from_key(key(KeyCode::Char('t'))),
@@ -892,6 +1050,10 @@ mod tests {
         assert_eq!(action_from_key(key(KeyCode::Char('o'))), Action::ChooseOurs);
         assert_eq!(action_from_key(key(KeyCode::Char('n'))), Action::ChooseOurs);
         assert_eq!(action_from_key(key(KeyCode::Char('q'))), Action::Quit);
+        assert_eq!(action_from_key(key(KeyCode::Char('u'))), Action::Undo);
+        assert_eq!(action_from_key(key(KeyCode::Enter)), Action::Finish);
+        assert_eq!(action_from_key(key(KeyCode::Char('h'))), Action::PanLeft);
+        assert_eq!(action_from_key(key(KeyCode::Char('l'))), Action::PanRight);
         assert_eq!(action_from_key(key(KeyCode::Esc)), Action::Quit);
         assert_eq!(action_from_key(ctrl(KeyCode::Char('c'))), Action::Quit);
         assert_eq!(action_from_key(key(KeyCode::Right)), Action::Next);

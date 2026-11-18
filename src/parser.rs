@@ -12,7 +12,6 @@ pub struct Conflict {
     pub end_line: usize,
     pub current_label: String,
     pub incoming_label: String,
-    pub original: Vec<String>,
     pub current: Vec<String>,
     pub incoming: Vec<String>,
 }
@@ -25,208 +24,108 @@ pub struct DecisionCounts {
     pub pending: usize,
 }
 
-pub fn parse_conflicts(lines: &[String]) -> Result<Vec<Conflict>, String> {
-    let mut conflicts = Vec::new();
-    let mut index = 0;
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Marker {
+    Start,
+    Base,
+    Separator,
+    End,
+}
 
-    while index < lines.len() {
-        let line = &lines[index];
-        if !line.starts_with("<<<<<<<") {
-            index += 1;
+fn marker(line: &str) -> Option<(Marker, usize, &str)> {
+    let line = line
+        .strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(line);
+    let first = *line.as_bytes().first()?;
+    let kind = match first {
+        b'<' => Marker::Start,
+        b'|' => Marker::Base,
+        b'=' => Marker::Separator,
+        b'>' => Marker::End,
+        _ => return None,
+    };
+    let width = line.bytes().take_while(|&byte| byte == first).count();
+    let suffix = &line[width..];
+    if !suffix.is_empty() && (kind == Marker::Separator || !suffix.starts_with([' ', '\t'])) {
+        return None;
+    }
+    Some((kind, width, suffix.trim()))
+}
+
+/// Git attributes disambiguate short markers and literal marker examples in the document.
+pub fn parse_conflicts(
+    lines: &[String],
+    marker_size: Option<usize>,
+) -> Result<Vec<Conflict>, String> {
+    let mut conflicts = Vec::new();
+    let mut rows = lines.iter().enumerate();
+    while let Some((start, line)) = rows.next() {
+        let Some((Marker::Start, width, label)) = marker(line) else {
+            continue;
+        };
+        if !marker_size.map_or(width >= 7, |size| size == width) {
             continue;
         }
 
-        let start = index;
-        let current_label = line.trim_start_matches("<<<<<<<").trim().to_string();
-        index += 1;
-
+        let mut section = Marker::Start;
         let mut current = Vec::new();
-        while index < lines.len()
-            && !lines[index].starts_with("=======")
-            && !lines[index].starts_with("|||||||")
-        {
-            current.push(lines[index].clone());
-            index += 1;
-        }
-
-        if index < lines.len() && lines[index].starts_with("|||||||") {
-            index += 1;
-            while index < lines.len() && !lines[index].starts_with("=======") {
-                index += 1;
-            }
-        }
-
-        if index >= lines.len() || !lines[index].starts_with("=======") {
-            return Err(format!(
-                "unterminated conflict starting at line {}",
-                start + 1
-            ));
-        }
-        index += 1;
-
         let mut incoming = Vec::new();
-        while index < lines.len() && !lines[index].starts_with(">>>>>>>") {
-            incoming.push(lines[index].clone());
-            index += 1;
-        }
-
-        if index >= lines.len() {
-            return Err(format!(
-                "unterminated conflict starting at line {}",
-                start + 1
-            ));
-        }
-
-        let incoming_label = lines[index]
-            .trim_start_matches(">>>>>>>")
-            .trim()
-            .to_string();
-        let end = index;
-        let original = lines[start..=end].to_vec();
+        let (end, incoming_label) = loop {
+            let (index, line) = rows
+                .next()
+                .ok_or_else(|| format!("unterminated conflict starting at line {}", start + 1))?;
+            match marker(line).filter(|(_, size, _)| *size == width) {
+                Some((Marker::Base, _, _)) if section == Marker::Start => section = Marker::Base,
+                Some((Marker::Separator, _, _)) if section != Marker::Separator => {
+                    section = Marker::Separator
+                }
+                Some((Marker::End, _, label)) if section == Marker::Separator => {
+                    break (index, label)
+                }
+                Some(_) => return Err(format!("unexpected conflict marker at line {}", index + 1)),
+                None if section == Marker::Start => current.push(line.clone()),
+                None if section == Marker::Separator => incoming.push(line.clone()),
+                None => {}
+            }
+        };
         conflicts.push(Conflict {
             start_line: start + 1,
             end_line: end + 1,
-            current_label,
-            incoming_label,
-            original,
+            current_label: label.to_owned(),
+            incoming_label: incoming_label.to_owned(),
             current,
             incoming,
         });
-        index += 1;
     }
-
     Ok(conflicts)
-}
-
-pub fn diff_as_conflicts(
-    current_lines: &[String],
-    incoming_lines: &[String],
-    current_label: String,
-    incoming_label: String,
-) -> Vec<Conflict> {
-    let ops = diff_ops(current_lines, incoming_lines);
-    let mut conflicts = Vec::new();
-    let mut index = 0;
-    let mut current_cursor = 0;
-
-    while index < ops.len() {
-        match &ops[index] {
-            DiffOp::Equal => {
-                current_cursor += 1;
-                index += 1;
-            }
-            DiffOp::Delete(_) | DiffOp::Insert(_) => {
-                let start_cursor = current_cursor;
-                let mut current = Vec::new();
-                let mut incoming = Vec::new();
-
-                while let Some(op) = ops.get(index) {
-                    match op {
-                        DiffOp::Equal => break,
-                        DiffOp::Delete(line) => {
-                            current.push(line.clone());
-                            current_cursor += 1;
-                        }
-                        DiffOp::Insert(line) => incoming.push(line.clone()),
-                    }
-                    index += 1;
-                }
-
-                conflicts.push(Conflict {
-                    start_line: start_cursor + 1,
-                    end_line: start_cursor + current.len(),
-                    current_label: current_label.clone(),
-                    incoming_label: incoming_label.clone(),
-                    original: current.clone(),
-                    current,
-                    incoming,
-                });
-            }
-        }
-    }
-
-    conflicts
 }
 
 pub fn apply_decisions(
     lines: &[String],
     conflicts: &[Conflict],
     decisions: &HashMap<usize, Decision>,
-    line_ending: &str,
 ) -> String {
-    let mut output = Vec::new();
+    let mut output = String::new();
     let mut cursor = 0;
-
     for (index, conflict) in conflicts.iter().enumerate() {
-        let start = conflict.start_line - 1;
-        let end_exclusive = conflict.end_line;
-        output.extend_from_slice(&lines[cursor..start]);
-        match decisions.get(&index) {
-            Some(Decision::Incoming) => output.extend(conflict.incoming.iter().cloned()),
-            Some(Decision::Current) => output.extend(conflict.current.iter().cloned()),
-            None => output.extend(conflict.original.iter().cloned()),
+        for line in &lines[cursor..conflict.start_line - 1] {
+            output.push_str(line);
         }
-        cursor = end_exclusive;
-    }
-
-    output.extend_from_slice(&lines[cursor..]);
-    output.join(line_ending)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DiffOp {
-    Equal,
-    Delete(String),
-    Insert(String),
-}
-
-fn diff_ops(current_lines: &[String], incoming_lines: &[String]) -> Vec<DiffOp> {
-    let rows = current_lines.len() + 1;
-    let columns = incoming_lines.len() + 1;
-    let mut lcs = vec![0_usize; rows * columns];
-
-    for current_index in (0..current_lines.len()).rev() {
-        for incoming_index in (0..incoming_lines.len()).rev() {
-            let cell = current_index * columns + incoming_index;
-            if current_lines[current_index] == incoming_lines[incoming_index] {
-                lcs[cell] = 1 + lcs[(current_index + 1) * columns + incoming_index + 1];
-            } else {
-                lcs[cell] = lcs[(current_index + 1) * columns + incoming_index]
-                    .max(lcs[current_index * columns + incoming_index + 1]);
-            }
+        let selected: &[String] = match decisions.get(&index) {
+            Some(Decision::Incoming) => &conflict.incoming,
+            Some(Decision::Current) => &conflict.current,
+            None => &lines[conflict.start_line - 1..conflict.end_line],
+        };
+        for line in selected {
+            output.push_str(line);
         }
+        cursor = conflict.end_line;
     }
-
-    let mut ops = Vec::new();
-    let mut current_index = 0;
-    let mut incoming_index = 0;
-
-    while current_index < current_lines.len() && incoming_index < incoming_lines.len() {
-        if current_lines[current_index] == incoming_lines[incoming_index] {
-            ops.push(DiffOp::Equal);
-            current_index += 1;
-            incoming_index += 1;
-        } else if lcs[(current_index + 1) * columns + incoming_index]
-            >= lcs[current_index * columns + incoming_index + 1]
-        {
-            ops.push(DiffOp::Delete(current_lines[current_index].clone()));
-            current_index += 1;
-        } else {
-            ops.push(DiffOp::Insert(incoming_lines[incoming_index].clone()));
-            incoming_index += 1;
-        }
+    for line in &lines[cursor..] {
+        output.push_str(line);
     }
-
-    while current_index < current_lines.len() {
-        ops.push(DiffOp::Delete(current_lines[current_index].clone()));
-        current_index += 1;
-    }
-    while incoming_index < incoming_lines.len() {
-        ops.push(DiffOp::Insert(incoming_lines[incoming_index].clone()));
-        incoming_index += 1;
-    }
-
-    ops
+    output
 }
 
 pub fn decision_counts(total: usize, decisions: &HashMap<usize, Decision>) -> DecisionCounts {
@@ -246,64 +145,55 @@ pub fn decision_counts(total: usize, decisions: &HashMap<usize, Decision>) -> De
     }
 }
 
-pub fn split_lines_preserving_empty_tail(source: &str) -> Vec<String> {
-    let mut lines: Vec<String> = source
-        .split('\n')
-        .map(|line| line.trim_end_matches('\r').to_string())
-        .collect();
-    if source.ends_with('\n') {
-        lines.pop();
-    }
-    lines
+pub fn split_lines(source: &str) -> Vec<String> {
+    source.split_inclusive('\n').map(str::to_owned).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::diff_as_conflicts;
 
     #[test]
     fn parses_conflicts_with_current_and_incoming_blocks() {
-        let lines = split_lines_preserving_empty_tail(
-            "a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nz\n",
-        );
-        let conflicts = parse_conflicts(&lines).unwrap();
+        let lines = split_lines("a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nz\n");
+        let conflicts = parse_conflicts(&lines, None).unwrap();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].start_line, 2);
         assert_eq!(conflicts[0].end_line, 6);
-        assert_eq!(conflicts[0].current, vec!["ours"]);
-        assert_eq!(conflicts[0].incoming, vec!["theirs"]);
+        assert_eq!(conflicts[0].current, vec!["ours\n"]);
+        assert_eq!(conflicts[0].incoming, vec!["theirs\n"]);
     }
 
     #[test]
     fn applies_reviewed_decisions_and_preserves_unreviewed_conflicts() {
-        let lines = split_lines_preserving_empty_tail(
+        let lines = split_lines(
             "a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nb\n<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> branch\nz\n",
         );
-        let conflicts = parse_conflicts(&lines).unwrap();
+        let conflicts = parse_conflicts(&lines, None).unwrap();
         let mut decisions = HashMap::new();
         decisions.insert(0, Decision::Incoming);
-        let output = apply_decisions(&lines, &conflicts, &decisions, "\n");
+        let output = apply_decisions(&lines, &conflicts, &decisions);
         assert!(output.contains("theirs"));
         assert!(!output.contains("ours"));
         assert!(output.contains("<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> branch"));
     }
 
     #[test]
-    fn preserves_requested_line_ending_when_applying_decisions() {
-        let lines = split_lines_preserving_empty_tail(
-            "a\r\n<<<<<<< HEAD\r\nours\r\n=======\r\ntheirs\r\n>>>>>>> branch\r\nz\r\n",
-        );
-        let conflicts = parse_conflicts(&lines).unwrap();
+    fn preserves_mixed_line_endings_when_applying_decisions() {
+        let lines =
+            split_lines("a\n<<<<<<< HEAD\r\nours\r\n=======\r\ntheirs\r\n>>>>>>> branch\r\nz\r\n");
+        let conflicts = parse_conflicts(&lines, None).unwrap();
         let mut decisions = HashMap::new();
         decisions.insert(0, Decision::Current);
-        let output = apply_decisions(&lines, &conflicts, &decisions, "\r\n");
-        assert_eq!(output, "a\r\nours\r\nz");
+        let output = apply_decisions(&lines, &conflicts, &decisions);
+        assert_eq!(output, "a\nours\r\nz\r\n");
     }
 
     #[test]
     fn builds_diff_conflicts_for_file_pairs() {
-        let current = split_lines_preserving_empty_tail("a\nold\nkeep\nremove\nz\n");
-        let incoming = split_lines_preserving_empty_tail("a\nnew\nkeep\nz\nadded\n");
+        let current = split_lines("a\nold\nkeep\nremove\nz\n");
+        let incoming = split_lines("a\nnew\nkeep\nz\nadded\n");
         let conflicts = diff_as_conflicts(
             &current,
             &incoming,
@@ -312,18 +202,18 @@ mod tests {
         );
 
         assert_eq!(conflicts.len(), 3);
-        assert_eq!(conflicts[0].current, vec!["old"]);
-        assert_eq!(conflicts[0].incoming, vec!["new"]);
-        assert_eq!(conflicts[1].current, vec!["remove"]);
+        assert_eq!(conflicts[0].current, vec!["old\n"]);
+        assert_eq!(conflicts[0].incoming, vec!["new\n"]);
+        assert_eq!(conflicts[1].current, vec!["remove\n"]);
         assert!(conflicts[1].incoming.is_empty());
         assert!(conflicts[2].current.is_empty());
-        assert_eq!(conflicts[2].incoming, vec!["added"]);
+        assert_eq!(conflicts[2].incoming, vec!["added\n"]);
     }
 
     #[test]
     fn unreviewed_diff_conflicts_keep_current_file_content() {
-        let current = split_lines_preserving_empty_tail("a\nz\n");
-        let incoming = split_lines_preserving_empty_tail("a\ninserted\nz\n");
+        let current = split_lines("a\nz\n");
+        let incoming = split_lines("a\ninserted\nz\n");
         let conflicts = diff_as_conflicts(
             &current,
             &incoming,
@@ -331,9 +221,9 @@ mod tests {
             "theirs".to_string(),
         );
 
-        let output = apply_decisions(&current, &conflicts, &HashMap::new(), "\n");
+        let output = apply_decisions(&current, &conflicts, &HashMap::new());
 
-        assert_eq!(output, "a\nz");
+        assert_eq!(output, "a\nz\n");
     }
 
     #[test]
@@ -348,8 +238,8 @@ mod tests {
         for (path, expected_conflicts) in fixtures {
             let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
             let source = std::fs::read_to_string(&fixture_path).unwrap();
-            let lines = split_lines_preserving_empty_tail(&source);
-            let conflicts = parse_conflicts(&lines).unwrap();
+            let lines = split_lines(&source);
+            let conflicts = parse_conflicts(&lines, None).unwrap();
 
             assert_eq!(
                 conflicts.len(),
@@ -361,6 +251,44 @@ mod tests {
     }
 
     #[test]
+    fn delimiters_match_the_opening_width_and_shape() {
+        let lines = split_lines("<<<<<<<<< ours\nkeep\n=======\n========= heading\n||||||||| base\nancestor\n=========\ntheirs\n>>>>>>> literal\n>>>>>>>>> branch\n");
+        let conflicts = parse_conflicts(&lines, Some(9)).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].current.concat(),
+            "keep\n=======\n========= heading\n"
+        );
+        assert_eq!(conflicts[0].incoming.concat(), "theirs\n>>>>>>> literal\n");
+        assert_eq!(conflicts[0].incoming_label, "branch");
+        assert!(
+            parse_conflicts(&split_lines("<<<<<<< ours\n=======\n>>>>> branch\n"), None).is_err()
+        );
+    }
+
+    #[test]
+    fn file_pair_choices_preserve_exact_bytes() {
+        for (ours, theirs) in [
+            ("abc", "abc\n"),
+            ("", "\n"),
+            ("old\n", ""),
+            ("", "new"),
+            ("a\n\n", "a\r\n"),
+            ("before\nmiddle\nafter", "changed\nmiddle\nafter\n"),
+        ] {
+            let lines = split_lines(ours);
+            let conflicts =
+                diff_as_conflicts(&lines, &split_lines(theirs), "ours".into(), "theirs".into());
+            assert!(!conflicts.is_empty());
+            assert_eq!(apply_decisions(&lines, &conflicts, &HashMap::new()), ours);
+            let incoming = (0..conflicts.len())
+                .map(|i| (i, Decision::Incoming))
+                .collect();
+            assert_eq!(apply_decisions(&lines, &conflicts, &incoming), theirs);
+        }
+    }
+
+    #[test]
     fn builds_diff_conflicts_for_checked_in_pair_fixture() {
         let current_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/pair/configA.yaml");
@@ -368,8 +296,8 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/pair/configB.yaml");
         let current = std::fs::read_to_string(current_path).unwrap();
         let incoming = std::fs::read_to_string(incoming_path).unwrap();
-        let current_lines = split_lines_preserving_empty_tail(&current);
-        let incoming_lines = split_lines_preserving_empty_tail(&incoming);
+        let current_lines = split_lines(&current);
+        let incoming_lines = split_lines(&incoming);
         let conflicts = diff_as_conflicts(
             &current_lines,
             &incoming_lines,
