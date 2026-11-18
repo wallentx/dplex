@@ -42,7 +42,7 @@ Useful Git mergetool starting point:
     tool = dplex
 
 [mergetool "dplex"]
-    cmd = dplex "$BASE" "$LOCAL" "$REMOTE" "$MERGED"
+    cmd = dplex \"$BASE\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\"
     trustExitCode = true
 
 [mergetool]

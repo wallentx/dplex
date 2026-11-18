@@ -88,7 +88,9 @@ def check(repo, env):
     )
     with (repo / ".git/config").open("a") as f:
         f.write("\n" + config)
-    git("config", "--get", "mergetool.dplex.cmd")
+    assert git("config", "--get", "mergetool.dplex.cmd") == (
+        b'dplex "$BASE" "$LOCAL" "$REMOTE" "$MERGED"\n'
+    )
     assert (
         git("config", "--get", "--bool", "mergetool.dplex.trustExitCode").strip()
         == b"true"

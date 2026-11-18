@@ -5,6 +5,7 @@ mod ui;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -50,8 +51,12 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 
     let save = |decisions: &HashMap<usize, Decision>, path: &Path| {
         let resolved = apply_decisions(&document.source_lines, &document.conflicts, decisions);
-        fs::write(path, resolved)
-            .map_err(|error| format!("failed to write {}: {error}", path.display()))
+        let mut file = fs::File::create(path).map_err(|error| {
+            ui::SaveError::Open(format!("failed to open {}: {error}", path.display()))
+        })?;
+        file.write_all(resolved.as_bytes()).map_err(|error| {
+            ui::SaveError::Write(format!("incomplete write to {}: {error}", path.display()))
+        })
     };
     let review = ui::review_conflicts(
         &document.display_path,

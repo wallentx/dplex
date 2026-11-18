@@ -58,13 +58,18 @@ struct ReviewState<'a> {
     source_lines: &'a [String],
     conflicts: &'a [Conflict],
     decisions: HashMap<usize, Decision>,
-    saved_decisions: HashMap<usize, Decision>,
+    saved_decisions: Option<HashMap<usize, Decision>>,
     history: Vec<(usize, Option<Decision>)>,
     current_index: usize,
     column: usize,
     scroll_top: usize,
     save_path: PathBuf,
     status_message: Option<String>,
+}
+
+pub enum SaveError {
+    Open(String),
+    Write(String),
 }
 
 pub fn review_conflicts<F>(
@@ -75,7 +80,7 @@ pub fn review_conflicts<F>(
     mut save: F,
 ) -> Result<ReviewOutcome, String>
 where
-    F: FnMut(&HashMap<usize, Decision>, &Path) -> Result<(), String>,
+    F: FnMut(&HashMap<usize, Decision>, &Path) -> Result<(), SaveError>,
 {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("interactive review requires a TTY".to_string());
@@ -91,7 +96,9 @@ where
             Action::ChooseOurs => state.choose(Decision::Current),
             Action::Undo => state.undo(),
             Action::Finish if state.decisions.len() == state.conflicts.len() => {
-                if state.saved_decisions == state.decisions || state.save(None, &mut save) {
+                if state.saved_decisions.as_ref() == Some(&state.decisions)
+                    || state.save(None, &mut save)
+                {
                     break false;
                 }
             }
@@ -99,7 +106,7 @@ where
                 state.status_message = Some("Choose a side for each hunk before finishing.".into());
             }
             Action::Quit => {
-                if state.decisions == state.saved_decisions {
+                if state.saved_decisions.as_ref() == Some(&state.decisions) {
                     break true;
                 }
                 match prompt_for_quit(&mut terminal, &state)? {
@@ -149,7 +156,9 @@ where
     };
 
     Ok(ReviewOutcome {
-        decisions: state.saved_decisions,
+        decisions: state
+            .saved_decisions
+            .ok_or("the last write was incomplete")?,
         quit,
         save_path: state.save_path,
     })
@@ -167,7 +176,7 @@ impl<'a> ReviewState<'a> {
             source_lines,
             conflicts,
             decisions: HashMap::new(),
-            saved_decisions: HashMap::new(),
+            saved_decisions: Some(HashMap::new()),
             history: Vec::new(),
             current_index: 0,
             column: 0,
@@ -208,7 +217,7 @@ impl<'a> ReviewState<'a> {
 
     fn save<F>(&mut self, path: Option<PathBuf>, save: &mut F) -> bool
     where
-        F: FnMut(&HashMap<usize, Decision>, &Path) -> Result<(), String>,
+        F: FnMut(&HashMap<usize, Decision>, &Path) -> Result<(), SaveError>,
     {
         let destination = path.as_deref().unwrap_or(&self.save_path);
         match save(&self.decisions, destination) {
@@ -217,11 +226,18 @@ impl<'a> ReviewState<'a> {
                 if let Some(path) = path {
                     self.save_path = path;
                 }
-                self.saved_decisions.clone_from(&self.decisions);
+                self.saved_decisions = Some(self.decisions.clone());
                 true
             }
             Err(error) => {
-                self.status_message = Some(error);
+                self.status_message = Some(match error {
+                    SaveError::Open(message) => message,
+                    SaveError::Write(message) => {
+                        // Save As can name the checkpoint through a symlink or hard link.
+                        self.saved_decisions = None;
+                        message
+                    }
+                });
                 false
             }
         }
@@ -480,13 +496,14 @@ fn build_document_view<'a>(state: &ReviewState<'a>) -> Vec<DocumentLine<'a>> {
             }
         }
 
-        match state
-            .decisions
-            .get(&conflict_index)
-            .filter(|_| conflict_index != state.current_index)
-        {
+        let decision = state.decisions.get(&conflict_index);
+        let saved = state
+            .saved_decisions
+            .as_ref()
+            .and_then(|saved| saved.get(&conflict_index));
+        let dirty = saved != decision;
+        match decision.filter(|_| conflict_index != state.current_index) {
             Some(Decision::Current) => {
-                let dirty = state.saved_decisions.get(&conflict_index) != Some(&Decision::Current);
                 for (offset, text) in conflict.current.iter().enumerate() {
                     lines.push(DocumentLine::Resolved {
                         conflict_index,
@@ -497,7 +514,6 @@ fn build_document_view<'a>(state: &ReviewState<'a>) -> Vec<DocumentLine<'a>> {
                 }
             }
             Some(Decision::Incoming) => {
-                let dirty = state.saved_decisions.get(&conflict_index) != Some(&Decision::Incoming);
                 for text in &conflict.incoming {
                     lines.push(DocumentLine::Resolved {
                         conflict_index,
@@ -1004,13 +1020,31 @@ mod tests {
         state.undo();
         assert_eq!(state.decisions[&0], Decision::Incoming);
         state.undo();
-        assert_eq!(state.decisions, state.saved_decisions);
+        assert_eq!(Some(&state.decisions), state.saved_decisions.as_ref());
         state.undo();
         assert!(state.decisions.is_empty());
-        assert_eq!(state.saved_decisions.len(), 1);
-        assert!(!state.save(Some("bad".into()), &mut |_, _| Err("denied".into())));
+        assert_eq!(state.saved_decisions.as_ref().unwrap().len(), 1);
+        assert!(
+            !state.save(Some("bad".into()), &mut |_, _| Err(SaveError::Open(
+                "denied".into()
+            )))
+        );
         assert_eq!(state.save_path, path);
-        assert_eq!(state.saved_decisions.len(), 1);
+        assert_eq!(state.saved_decisions.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incomplete_write_invalidates_a_completed_checkpoint_until_retry() {
+        let source = crate::parser::split_lines("<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n");
+        let conflicts = crate::parser::parse_conflicts(&source, None).unwrap();
+        let path = Path::new("merged");
+        let mut state = ReviewState::new(path, &source, &conflicts, path.into());
+        state.choose(Decision::Incoming);
+        assert!(state.save(None, &mut |_, _| Ok(())));
+        assert!(!state.save(None, &mut |_, _| Err(SaveError::Write("disk full".into()))));
+        assert_eq!(state.saved_decisions, None);
+        assert!(state.save(None, &mut |_, _| Ok(())));
+        assert_eq!(state.saved_decisions.as_ref(), Some(&state.decisions));
     }
 
     #[test]
