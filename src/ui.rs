@@ -58,7 +58,7 @@ struct ReviewState<'a> {
     source_lines: &'a [String],
     conflicts: &'a [Conflict],
     decisions: HashMap<usize, Decision>,
-    saved_decisions: Option<HashMap<usize, Decision>>,
+    saved_decisions: Result<HashMap<usize, Decision>, String>,
     history: Vec<(usize, Option<Decision>)>,
     current_index: usize,
     column: usize,
@@ -96,7 +96,7 @@ where
             Action::ChooseOurs => state.choose(Decision::Current),
             Action::Undo => state.undo(),
             Action::Finish if state.decisions.len() == state.conflicts.len() => {
-                if state.saved_decisions.as_ref() == Some(&state.decisions)
+                if state.saved_decisions.as_ref() == Ok(&state.decisions)
                     || state.save(None, &mut save)
                 {
                     break false;
@@ -106,7 +106,7 @@ where
                 state.status_message = Some("Choose a side for each hunk before finishing.".into());
             }
             Action::Quit => {
-                if state.saved_decisions.as_ref() == Some(&state.decisions) {
+                if state.saved_decisions.as_ref() == Ok(&state.decisions) {
                     break true;
                 }
                 match prompt_for_quit(&mut terminal, &state)? {
@@ -156,9 +156,7 @@ where
     };
 
     Ok(ReviewOutcome {
-        decisions: state
-            .saved_decisions
-            .ok_or("the last write was incomplete")?,
+        decisions: state.saved_decisions?,
         quit,
         save_path: state.save_path,
     })
@@ -176,7 +174,7 @@ impl<'a> ReviewState<'a> {
             source_lines,
             conflicts,
             decisions: HashMap::new(),
-            saved_decisions: Some(HashMap::new()),
+            saved_decisions: Ok(HashMap::new()),
             history: Vec::new(),
             current_index: 0,
             column: 0,
@@ -226,7 +224,7 @@ impl<'a> ReviewState<'a> {
                 if let Some(path) = path {
                     self.save_path = path;
                 }
-                self.saved_decisions = Some(self.decisions.clone());
+                self.saved_decisions = Ok(self.decisions.clone());
                 true
             }
             Err(error) => {
@@ -234,7 +232,7 @@ impl<'a> ReviewState<'a> {
                     SaveError::Open(message) => message,
                     SaveError::Write(message) => {
                         // Save As can name the checkpoint through a symlink or hard link.
-                        self.saved_decisions = None;
+                        self.saved_decisions = Err(message.clone());
                         message
                     }
                 });
@@ -500,6 +498,7 @@ fn build_document_view<'a>(state: &ReviewState<'a>) -> Vec<DocumentLine<'a>> {
         let saved = state
             .saved_decisions
             .as_ref()
+            .ok()
             .and_then(|saved| saved.get(&conflict_index));
         let dirty = saved != decision;
         match decision.filter(|_| conflict_index != state.current_index) {
@@ -1020,7 +1019,7 @@ mod tests {
         state.undo();
         assert_eq!(state.decisions[&0], Decision::Incoming);
         state.undo();
-        assert_eq!(Some(&state.decisions), state.saved_decisions.as_ref());
+        assert_eq!(Ok(&state.decisions), state.saved_decisions.as_ref());
         state.undo();
         assert!(state.decisions.is_empty());
         assert_eq!(state.saved_decisions.as_ref().unwrap().len(), 1);
@@ -1041,10 +1040,15 @@ mod tests {
         let mut state = ReviewState::new(path, &source, &conflicts, path.into());
         state.choose(Decision::Incoming);
         assert!(state.save(None, &mut |_, _| Ok(())));
-        assert!(!state.save(None, &mut |_, _| Err(SaveError::Write("disk full".into()))));
-        assert_eq!(state.saved_decisions, None);
+        let error = "incomplete write to alternate.txt: disk full";
+        assert!(!state.save(Some("alternate.txt".into()), &mut |_, _| {
+            Err(SaveError::Write(error.into()))
+        }));
+        state.focus(0);
+        assert!(state.status_message.is_none());
+        assert_eq!(state.saved_decisions.as_ref().unwrap_err(), error);
         assert!(state.save(None, &mut |_, _| Ok(())));
-        assert_eq!(state.saved_decisions.as_ref(), Some(&state.decisions));
+        assert_eq!(state.saved_decisions.as_ref(), Ok(&state.decisions));
     }
 
     #[test]
