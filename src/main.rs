@@ -1,17 +1,18 @@
+mod diff;
 mod parser;
 mod ui;
 
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
-use parser::{
-    apply_decisions, decision_counts, diff_as_conflicts, parse_conflicts,
-    split_lines_preserving_empty_tail, Conflict, Decision,
-};
+use diff::diff_as_conflicts;
+
+use parser::{apply_decisions, decision_counts, parse_conflicts, split_lines, Conflict, Decision};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -24,7 +25,7 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Vec<String>) -> Result<ExitCode, String> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if matches!(args.as_slice(), [flag] if flag == "-h" || flag == "--help") {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
@@ -34,22 +35,28 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
 
+    let mergetool = matches!(input, InputMode::GitMergetool { .. });
     let document = load_review_document(input)?;
 
     if document.conflicts.is_empty() {
+        if mergetool {
+            return Err(format!(
+                "Git merge resolution was not confirmed for {} (no conflict markers found)",
+                document.display_path.display()
+            ));
+        }
         println!("{}", document.empty_message);
         return Ok(ExitCode::SUCCESS);
     }
 
     let save = |decisions: &HashMap<usize, Decision>, path: &Path| {
-        save_review(
-            path,
-            &document.source_lines,
-            &document.conflicts,
-            decisions,
-            &document.line_ending,
-            document.has_trailing_newline,
-        )
+        let resolved = apply_decisions(&document.source_lines, &document.conflicts, decisions);
+        let mut file = fs::File::create(path).map_err(|error| {
+            ui::SaveError::Open(format!("failed to open {}: {error}", path.display()))
+        })?;
+        file.write_all(resolved.as_bytes()).map_err(|error| {
+            ui::SaveError::Write(format!("incomplete write to {}: {error}", path.display()))
+        })
     };
     let review = ui::review_conflicts(
         &document.display_path,
@@ -58,15 +65,6 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         document.default_save_path.clone(),
         save,
     )?;
-    save_review(
-        &review.save_path,
-        &document.source_lines,
-        &document.conflicts,
-        &review.decisions,
-        &document.line_ending,
-        document.has_trailing_newline,
-    )?;
-
     let counts = decision_counts(document.conflicts.len(), &review.decisions);
     println!(
         "Resolved {} conflict{} in {}. Chose ours for {}, theirs for {}.",
@@ -86,12 +84,22 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(130));
     }
 
+    if mergetool
+        && review.save_path != document.default_save_path
+        && !matches!((review.save_path.canonicalize(), document.default_save_path.canonicalize()),
+            (Ok(saved), Ok(merged)) if saved == merged)
+    {
+        return Err(format!(
+            "Git needs the resolved file at {}",
+            document.default_save_path.display()
+        ));
+    }
     Ok(ExitCode::SUCCESS)
 }
 
 fn print_help() {
     println!(
-        "dplex\n\nUsage:\n  dplex <conflicted-file>\n  dplex <ours-file> <theirs-file>\n  dplex <base> <local> <remote> <merged>\n\nKeys:\n  o         choose ours\n  t         choose theirs\n  Ctrl+s    save\n  S         save as\n  q/Esc/C-c quit\n  ←/→       previous/next hunk\n  ↑/↓       scroll\n  PgUp/PgDn page"
+        "dplex\n\nUsage:\n  dplex <conflicted-file>\n  dplex <ours-file> <theirs-file>\n  dplex <base> <local> <remote> <merged>\n\nKeys:\n  o         choose ours\n  t         choose theirs\n  Ctrl+s    save\n  S         save as\n  u         undo last choice\n  Enter     save and finish after reviewing all hunks\n  q/Esc/C-c quit (prompts for unsaved changes)\n  ←/→       previous/next hunk\n  h/l       scroll left/right\n  ↑/↓       scroll\n  PgUp/PgDn page"
     );
 }
 
@@ -106,8 +114,6 @@ struct ReviewDocument {
     default_save_path: PathBuf,
     source_lines: Vec<String>,
     conflicts: Vec<Conflict>,
-    line_ending: String,
-    has_trailing_newline: bool,
     empty_message: String,
 }
 
@@ -129,26 +135,25 @@ fn input_mode_from_args(args: &[String]) -> Option<InputMode<'_>> {
 
 fn load_review_document(input: InputMode<'_>) -> Result<ReviewDocument, String> {
     match input {
-        InputMode::ConflictFile { path } => load_conflicted_file(path),
-        InputMode::GitMergetool { merged } => load_conflicted_file(merged),
+        InputMode::ConflictFile { path } => load_conflicted_file(path, false),
+        InputMode::GitMergetool { merged } => load_conflicted_file(merged, true),
         InputMode::FilePair { current, incoming } => load_file_pair(current, incoming),
     }
 }
 
-fn load_conflicted_file(path: &str) -> Result<ReviewDocument, String> {
+fn load_conflicted_file(path: &str, mergetool: bool) -> Result<ReviewDocument, String> {
     let path = PathBuf::from(path);
     let source = fs::read_to_string(&path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let source_lines = split_lines_preserving_empty_tail(&source);
-    let conflicts = parse_conflicts(&source_lines)?;
+    let source_lines = split_lines(&source);
+    let marker_size = git_marker_size(&path).or(mergetool.then_some(7));
+    let conflicts = parse_conflicts(&source_lines, marker_size)?;
 
     Ok(ReviewDocument {
         display_path: path.clone(),
         default_save_path: path.clone(),
         source_lines,
         conflicts,
-        line_ending: line_ending_for(&source).to_string(),
-        has_trailing_newline: source.ends_with('\n'),
         empty_message: format!("dplex: no conflict markers found in {}", path.display()),
     })
 }
@@ -160,8 +165,8 @@ fn load_file_pair(current: &str, incoming: &str) -> Result<ReviewDocument, Strin
         .map_err(|error| format!("failed to read {}: {error}", current_path.display()))?;
     let incoming_source = fs::read_to_string(&incoming_path)
         .map_err(|error| format!("failed to read {}: {error}", incoming_path.display()))?;
-    let current_lines = split_lines_preserving_empty_tail(&current_source);
-    let incoming_lines = split_lines_preserving_empty_tail(&incoming_source);
+    let current_lines = split_lines(&current_source);
+    let incoming_lines = split_lines(&incoming_source);
     let conflicts = diff_as_conflicts(
         &current_lines,
         &incoming_lines,
@@ -174,8 +179,6 @@ fn load_file_pair(current: &str, incoming: &str) -> Result<ReviewDocument, Strin
         default_save_path: current_path.clone(),
         source_lines: current_lines,
         conflicts,
-        line_ending: line_ending_for(&current_source).to_string(),
-        has_trailing_newline: current_source.ends_with('\n'),
         empty_message: format!(
             "dplex: no differences found between {} and {}",
             current_path.display(),
@@ -184,28 +187,28 @@ fn load_file_pair(current: &str, incoming: &str) -> Result<ReviewDocument, Strin
     })
 }
 
-fn save_review(
-    path: &Path,
-    source_lines: &[String],
-    conflicts: &[Conflict],
-    decisions: &HashMap<usize, Decision>,
-    line_ending: &str,
-    has_trailing_newline: bool,
-) -> Result<(), String> {
-    let mut resolved = apply_decisions(source_lines, conflicts, decisions, line_ending);
-    if has_trailing_newline {
-        resolved.push_str(line_ending);
+fn git_marker_size(path: &Path) -> Option<usize> {
+    // Run from the file's directory so absolute and repository-relative inputs
+    // resolve the same per-path attributes, including in linked worktrees.
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let output = Command::new("git")
+        .current_dir(parent)
+        .args(["check-attr", "-z", "conflict-marker-size", "--"])
+        .arg(path.file_name()?)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    fs::write(path, resolved)
-        .map_err(|error| format!("failed to write {}: {error}", path.display()))
-}
-
-fn line_ending_for(source: &str) -> &'static str {
-    if source.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
+    let value = output.stdout.split(|&byte| byte == 0).nth(2)?;
+    std::str::from_utf8(value)
+        .ok()?
+        .parse::<usize>()
+        .ok()
+        .filter(|&size| size > 0)
 }
 
 fn plural(count: usize) -> &'static str {

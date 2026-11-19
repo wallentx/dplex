@@ -8,3 +8,4 @@ description = "Interactive terminal merge conflict reviewer"
 [dependencies]
 crossterm = "0.28"
 ratatui = "0.29"
+similar = { version = "2.7", default-features = false }

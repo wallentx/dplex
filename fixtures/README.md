@@ -59,8 +59,8 @@ The configured Git mergetool command this mirrors is:
 [merge]
     tool = dplex
 
-[merge.tool "dplex"]
-    cmd = dplex "$BASE" "$LOCAL" "$REMOTE" "$MERGED"
+[mergetool "dplex"]
+    cmd = dplex \"$BASE\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\"
     trustExitCode = true
 
 [mergetool]
